@@ -36,7 +36,7 @@ def _rollout_batch(batch_size: int) -> dict:
     }
 
 
-@pytest.mark.parametrize("n_episodes", [1, 4, 6])
+@pytest.mark.parametrize("n_episodes", range(1, 8))
 def test_eval_policy_returns_exactly_requested_episode_data(monkeypatch, n_episodes):
     batch_size = 3
     n_batches = (n_episodes + batch_size - 1) // batch_size

@@ -36,10 +36,11 @@ def _rollout_batch(batch_size: int) -> dict:
     }
 
 
-def test_eval_policy_returns_exactly_requested_episode_data(monkeypatch):
+@pytest.mark.parametrize("n_episodes", [1, 4, 6])
+def test_eval_policy_returns_exactly_requested_episode_data(monkeypatch, n_episodes):
     batch_size = 3
-    n_episodes = 4
-    rollouts = iter([_rollout_batch(batch_size), _rollout_batch(batch_size)])
+    n_batches = (n_episodes + batch_size - 1) // batch_size
+    rollouts = iter([_rollout_batch(batch_size) for _ in range(n_batches)])
 
     monkeypatch.setattr(lerobot_eval, "rollout", lambda **_: next(rollouts))
 

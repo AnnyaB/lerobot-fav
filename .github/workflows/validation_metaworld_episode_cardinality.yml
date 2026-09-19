@@ -1,0 +1,43 @@
+name: Validation — MetaWorld episode cardinality
+
+on:
+  pull_request:
+    paths:
+      - "scripts/validation/validate_eval_episode_cardinality_metaworld.py"
+      - ".github/workflows/validation_metaworld_episode_cardinality.yml"
+      - "src/lerobot/scripts/lerobot_eval.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metaworld-validation:
+    runs-on: ubuntu-latest
+    env:
+      MUJOCO_GL: osmesa
+      UV_VERSION: "0.11.30"
+      PYTHON_VERSION: "3.12"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install headless rendering libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libosmesa6-dev libgl1-mesa-glx libglfw3
+
+      - name: Setup uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        with:
+          enable-cache: true
+          version: "${{ env.UV_VERSION }}"
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Install LeRobot with MetaWorld
+        run: uv pip install -e ".[metaworld,dataset]"
+
+      - name: Run real-simulator cardinality probe
+        run: uv run python scripts/validation/validate_eval_episode_cardinality_metaworld.py

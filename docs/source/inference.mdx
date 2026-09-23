@@ -433,7 +433,7 @@ strategy.teardown(ctx)  # teardown stays with the caller
 | `--task`                          | Task description (used when no dataset is provided)               | --      |
 | `--display_data`                  | Stream telemetry to Rerun visualization                           | false   |
 | `--display_ip` / `--display_port` | Remote Rerun server address                                       | --      |
-| `--interpolation_multiplier`      | Robot commands per policy action (control at `fps × N` Hz)        | 1       |
+| `--interpolation_multiplier`      | Robot commands per policy action; EE rotvecs use shortest-path SO(3) interpolation | 1       |
 | `--interactive`                   | Chat session on stdin; robot idles until `/start` (base, sentry)  | false   |
 | `--use_torch_compile`             | Enable `torch.compile` for inference                              | false   |
 | `--resume`                        | Resume a previous recording session                               | false   |

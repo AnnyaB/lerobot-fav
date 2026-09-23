@@ -277,6 +277,81 @@ def test_interpolation_3x_last_step_equals_target(interp3):
     torch.testing.assert_close(last, target)
 
 
+# ====================== SO(3) Rotation Interpolation Tests ======================
+
+
+def test_ee_rotvec_interpolation_avoids_antipodal_identity_sweep():
+    """Regression for #3691: nearby rotations must follow the short SO(3) path."""
+    keys = ["r.ee.x", "r.ee.y", "r.ee.z", "r.ee.wx", "r.ee.wy", "r.ee.wz"]
+    interp = ActionInterpolator(multiplier=5, action_keys=keys)
+
+    prev = torch.tensor([0.0, 0.0, 0.0, 1.45, -0.14, 2.34])
+    target = torch.tensor([1.0, 2.0, 3.0, -1.72, -0.38, -2.31])
+
+    interp.add(prev)
+    torch.testing.assert_close(interp.get(), prev)
+
+    interp.add(target)
+    steps = [interp.get() for _ in range(5)]
+    assert all(step is not None for step in steps)
+
+    # Euclidean rotvec interpolation for this real failure case dives toward
+    # identity (reported norm around 0.5 rad). Geodesic interpolation stays
+    # near pi while taking the physically short path between orientations.
+    rotvec_norms = [torch.linalg.vector_norm(step[3:6]).item() for step in steps[:-1]]
+    assert min(rotvec_norms) > 2.5
+
+    # Non-rotational coordinates keep the existing linear interpolation.
+    for i, step in enumerate(steps, start=1):
+        torch.testing.assert_close(step[:3], target[:3] * (i / 5))
+
+    # Preserve the policy endpoint bit-for-bit, including its chosen rotvec
+    # representative rather than replacing it with an equivalent principal one.
+    assert torch.equal(steps[-1], target)
+
+
+def test_bimanual_ee_rotvec_groups_are_interpolated_independently():
+    """Both namespaced EE orientation triplets use SO(3)-aware interpolation."""
+    keys = [
+        "l.ee.wx",
+        "l.ee.wy",
+        "l.ee.wz",
+        "gripper",
+        "r.ee.wx",
+        "r.ee.wy",
+        "r.ee.wz",
+    ]
+    interp = ActionInterpolator(multiplier=2, action_keys=keys)
+
+    prev = torch.tensor([1.45, -0.14, 2.34, 0.0, -1.45, 0.14, -2.34])
+    target = torch.tensor([-1.72, -0.38, -2.31, 1.0, 1.72, 0.38, 2.31])
+
+    interp.add(prev)
+    interp.get()
+    interp.add(target)
+    midpoint = interp.get()
+
+    assert midpoint is not None
+    assert torch.linalg.vector_norm(midpoint[:3]).item() > 2.5
+    assert torch.linalg.vector_norm(midpoint[4:7]).item() > 2.5
+    assert midpoint[3].item() == pytest.approx(0.5)
+
+
+def test_generic_angular_velocity_fields_remain_linear():
+    """Do not reinterpret generic wx/wy/wz fields as an SO(3) orientation."""
+    keys = ["angular_velocity.wx", "angular_velocity.wy", "angular_velocity.wz"]
+    interp = ActionInterpolator(multiplier=2, action_keys=keys)
+
+    prev = torch.tensor([1.0, 2.0, 3.0])
+    target = torch.tensor([3.0, 4.0, 5.0])
+
+    interp.add(prev)
+    interp.get()
+    interp.add(target)
+
+    torch.testing.assert_close(interp.get(), torch.tensor([2.0, 3.0, 4.0]))
+
+
 # ====================== Reset Tests ======================
 
 

@@ -123,8 +123,9 @@ def _slerp_rotvec(start: Tensor, end: Tensor, t: float) -> Tensor:
 class ActionInterpolator:
     """Interpolates between consecutive actions for smoother control.
 
-    When enabled with multiplier N, produces N actions per policy action
-    by linearly interpolating between the previous and current action.
+    When enabled with multiplier N, produces N actions per policy action.
+    Ordinary coordinates use linear interpolation; recognized end-effector
+    rotation vectors use shortest-path interpolation on SO(3).
 
     Example with multiplier=3:
         prev_action -> [1/3 interpolated, 2/3 interpolated, current_action]

@@ -25,15 +25,11 @@ from lerobot.rollout.inference.rtc import RTCInferenceEngine
 
 
 def _make_engine() -> RTCInferenceEngine:
-    """Build only the state needed by the RTC snapshot/action boundary.
-
-    These tests exercise the production RTCInferenceEngine methods directly; no
-    alternate inference adapter or shadow implementation is used.
-    """
+    """Build only production RTC state needed by the snapshot/action boundary."""
     engine = RTCInferenceEngine.__new__(RTCInferenceEngine)
     InferenceEngine.__init__(engine, task="pick")
     engine._obs_lock = Lock()
-    engine._obs_holder = {"obs": None, "robot_type": "test"}
+    engine._obs_holder = {"obs": None, "state_snapshot": None, "robot_type": "test"}
     engine._reset_epoch = 0
     engine._action_queue = ActionQueue(RTCConfig(enabled=True, execution_horizon=3))
     return engine
@@ -43,7 +39,7 @@ def _chunk(offset: float = 0.0) -> torch.Tensor:
     return torch.arange(12, dtype=torch.float32).reshape(4, 3) + offset
 
 
-def test_worker_snapshot_pairs_observation_with_one_queue_cursor():
+def test_notification_binds_observation_to_pre_dispatch_queue_cursor():
     engine = _make_engine()
     original = _chunk()
     processed = _chunk(100)
@@ -57,8 +53,13 @@ def test_worker_snapshot_pairs_observation_with_one_queue_cursor():
     assert first.queue.action_index == 0
     torch.testing.assert_close(first.queue.original_left_over, original)
 
+    # The rollout contract notifies before get_action(). Consuming that action must not
+    # mutate the already-bound snapshot or invalidate its queue generation.
     returned = engine.get_action(None)
     torch.testing.assert_close(returned, processed[0])
+    still_first = engine._capture_state_snapshot()
+    assert still_first is first
+    assert still_first.queue.action_index == 0
 
     obs1 = {"observation.state": torch.tensor([1.0])}
     engine.notify_observation(obs1)
@@ -68,47 +69,43 @@ def test_worker_snapshot_pairs_observation_with_one_queue_cursor():
     assert second.queue.action_index == 1
     torch.testing.assert_close(second.queue.original_left_over, original[1:])
 
-    # A live action pop cannot retroactively mutate an already captured snapshot.
-    assert first.queue.action_index == 0
-    torch.testing.assert_close(first.queue.original_left_over, original)
 
-
-def test_chunk_replacement_after_notification_is_visible_without_republishing_observation():
-    """Regression for caching queue state inside notify_observation().
-
-    A previous inference may finish after the latest observation notification and
-    replace the action queue. The next worker snapshot must pair that latest
-    observation with the replacement queue, not a queue tail cached at notification
-    time.
-    """
+def test_queue_replacement_fences_old_observation_until_fresh_notification():
+    """A new action chunk may not be paired with an observation captured before it existed."""
     engine = _make_engine()
     old = _chunk()
     new = _chunk(1000)
     engine._action_queue.merge(old, old, real_delay=0, task="pick")
 
-    observation = {"observation.state": torch.tensor([5.0])}
-    engine.notify_observation(observation)
+    old_obs = {"observation.state": torch.tensor([5.0])}
+    engine.notify_observation(old_obs)
     before = engine._capture_state_snapshot()
     assert before is not None
-    torch.testing.assert_close(before.queue.original_left_over, old)
+    old_generation = before.queue.generation
 
-    # This mirrors the RTC worker's merge critical section: outer engine lock,
-    # then ActionQueue's lock.
+    # Mirror RTC's publish critical section. merge() structurally replaces the queue
+    # and advances its generation.
     with engine._obs_lock:
         engine._action_queue.merge(new, new, real_delay=0, action_index_before_inference=0, task="pick")
 
+    assert engine._action_queue.get_generation() == old_generation + 1
+    assert engine._capture_state_snapshot() is None
+
+    # Only a new control-tick observation can establish the next valid pair.
+    new_obs = {"observation.state": torch.tensor([6.0])}
+    engine.notify_observation(new_obs)
     after = engine._capture_state_snapshot()
     assert after is not None
-    assert after.observation is observation
+    assert after.observation is new_obs
+    assert after.queue.generation == old_generation + 1
     torch.testing.assert_close(after.queue.original_left_over, new)
 
 
-def test_action_pop_cannot_interleave_inside_snapshot_capture(monkeypatch):
-    """Force the dangerous interleaving with Events instead of sleeps."""
+def test_action_pop_cannot_interleave_inside_observation_snapshot(monkeypatch):
+    """Force the dangerous notify/get interleaving with Events instead of sleeps."""
     engine = _make_engine()
     original = _chunk()
     engine._action_queue.merge(original, original, real_delay=0, task="pick")
-    engine.notify_observation({"observation.state": torch.tensor([2.0])})
 
     entered_snapshot = Event()
     release_snapshot = Event()
@@ -121,31 +118,24 @@ def test_action_pop_cannot_interleave_inside_snapshot_capture(monkeypatch):
 
     monkeypatch.setattr(engine._action_queue, "snapshot", gated_snapshot)
 
-    result = {}
-
-    def capture():
-        result["snapshot"] = engine._capture_state_snapshot()
-
-    returned = {}
-
-    def pop():
-        returned["action"] = engine.get_action(None)
-
-    capture_thread = Thread(target=capture)
-    capture_thread.start()
+    observation = {"observation.state": torch.tensor([2.0])}
+    notify_thread = Thread(target=lambda: engine.notify_observation(observation))
+    notify_thread.start()
     assert entered_snapshot.wait(timeout=2)
 
-    # Capture now owns _obs_lock. get_action() must wait for the same outer lock.
-    pop_thread = Thread(target=pop)
+    returned = {}
+    pop_thread = Thread(target=lambda: returned.setdefault("action", engine.get_action(None)))
     pop_thread.start()
 
+    # notify_observation owns _obs_lock while snapshot() is gated, so get_action()
+    # cannot advance the queue cursor until the observation-bound snapshot is complete.
     release_snapshot.set()
-    capture_thread.join(timeout=2)
+    notify_thread.join(timeout=2)
     pop_thread.join(timeout=2)
-    assert not capture_thread.is_alive()
+    assert not notify_thread.is_alive()
     assert not pop_thread.is_alive()
 
-    snapshot = result["snapshot"]
+    snapshot = engine._obs_holder["state_snapshot"]
     assert snapshot is not None
     assert snapshot.queue.action_index == 0
     torch.testing.assert_close(snapshot.queue.original_left_over, original)
@@ -153,7 +143,28 @@ def test_action_pop_cannot_interleave_inside_snapshot_capture(monkeypatch):
     assert engine._action_queue.get_action_index() == 1
 
 
-def test_snapshot_epoch_is_bound_to_the_same_capture_boundary():
+def test_queue_generation_changes_only_for_structural_mutations():
+    engine = _make_engine()
+    queue = engine._action_queue
+    original = _chunk()
+
+    g0 = queue.get_generation()
+    queue.merge(original, original, real_delay=0, task="pick")
+    g1 = queue.get_generation()
+    assert g1 == g0 + 1
+
+    queue.get()
+    assert queue.get_generation() == g1
+
+    queue.merge(original + 10, original + 10, real_delay=0, task="pick")
+    g2 = queue.get_generation()
+    assert g2 == g1 + 1
+
+    queue.clear()
+    assert queue.get_generation() == g2 + 1
+
+
+def test_reset_epoch_and_queue_generation_both_fence_snapshot():
     engine = _make_engine()
     original = _chunk()
     engine._action_queue.merge(original, original, real_delay=0, task="pick")
@@ -163,11 +174,13 @@ def test_snapshot_epoch_is_bound_to_the_same_capture_boundary():
     assert snapshot is not None
     assert snapshot.reset_epoch == 0
 
-    # Mirror reset's clear-and-bump critical section without needing a policy.
+    # Mirror reset's single outer critical section without constructing a policy.
     with engine._obs_lock:
         engine._action_queue.clear()
         engine._obs_holder["obs"] = None
+        engine._obs_holder["state_snapshot"] = None
         engine._reset_epoch += 1
 
     assert snapshot.reset_epoch != engine._reset_epoch
+    assert snapshot.queue.generation != engine._action_queue.get_generation()
     assert engine._capture_state_snapshot() is None

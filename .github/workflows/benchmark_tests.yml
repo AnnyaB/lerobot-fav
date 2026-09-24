@@ -507,6 +507,7 @@ jobs:
                 --policy.path=lerobot/smolvla_robocasa \
                 --env.type=robocasa \
                 --env.task=CloseFridge,OpenCabinet,OpenDrawer,TurnOnMicrowave,TurnOffStove,CloseToasterOvenDoor,SlideDishwasherRack,TurnOnSinkFaucet,NavigateKitchen,TurnOnElectricKettle \
+                --env.split=target \
                 --env.task_description_source=task \
                 --env.max_parallel_tasks=5 \
                 --eval.batch_size=1 \

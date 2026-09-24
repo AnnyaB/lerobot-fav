@@ -42,6 +42,7 @@ class ActionQueueSnapshot:
     pops another action immediately after the snapshot is returned.
     """
 
+    generation: int
     action_index: int
     remaining: int
     original_left_over: Tensor | None
@@ -82,6 +83,9 @@ class ActionQueue:
         self._task_queue: list[str | None] | None = None
         self.lock = Lock()
         self.last_index = 0
+        # Structural queue version. Action consumption advances last_index but does not
+        # change generation; clear/merge replace the logical queue and fence snapshots.
+        self._generation = 0
         self.cfg = cfg
 
     def get(self) -> Tensor | None:
@@ -119,6 +123,7 @@ class ActionQueue:
             self.original_queue = None
             self._task_queue = None
             self.last_index = 0
+            self._generation += 1
 
     def qsize(self) -> int:
         """Get the number of remaining actions in the queue.
@@ -142,6 +147,16 @@ class ActionQueue:
                 return True
             return len(self.queue) - self.last_index <= 0
 
+    def get_generation(self) -> int:
+        """Return the structural queue generation.
+
+        ``get()`` intentionally does not change this value: an observation-bound
+        snapshot remains valid while actions from that same queue are consumed.
+        ``merge()`` and ``clear()`` advance it because they replace the logical queue.
+        """
+        with self.lock:
+            return self._generation
+
     def snapshot(self) -> ActionQueueSnapshot:
         """Capture the queue cursor and both action tails atomically.
 
@@ -159,6 +174,7 @@ class ActionQueue:
                 None if self.queue is None else self.queue[self.last_index :].clone()
             )
             return ActionQueueSnapshot(
+                generation=self._generation,
                 action_index=self.last_index,
                 remaining=remaining,
                 original_left_over=original_left_over,
@@ -228,9 +244,11 @@ class ActionQueue:
 
             if self.cfg.enabled:
                 self._replace_actions_queue(original_actions, processed_actions, delay, task)
+                self._generation += 1
                 return
 
             self._append_actions_queue(original_actions, processed_actions, task)
+            self._generation += 1
 
     def _replace_actions_queue(
         self,

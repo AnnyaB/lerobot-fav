@@ -22,6 +22,7 @@ handling action merging and leftover tracking.
 """
 
 import logging
+from dataclasses import dataclass
 from threading import Lock
 
 import torch
@@ -30,6 +31,21 @@ from torch import Tensor
 from .configuration_rtc import RTCConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ActionQueueSnapshot:
+    """Detached view of the action queue at one lock-protected instant.
+
+    The original and processed tails are cloned while holding the queue lock, so
+    every field describes the same consumption cursor even if the control thread
+    pops another action immediately after the snapshot is returned.
+    """
+
+    action_index: int
+    remaining: int
+    original_left_over: Tensor | None
+    processed_left_over: Tensor | None
 
 
 class ActionQueue:
@@ -125,6 +141,29 @@ class ActionQueue:
             if self.queue is None:
                 return True
             return len(self.queue) - self.last_index <= 0
+
+    def snapshot(self) -> ActionQueueSnapshot:
+        """Capture the queue cursor and both action tails atomically.
+
+        Reading these values through separate methods allows the control thread to
+        consume an action between reads, producing a mixed-time RTC state.  This
+        method clones both tails under one lock so callers can reason about one
+        coherent queue instant.
+        """
+        with self.lock:
+            remaining = 0 if self.queue is None else max(0, len(self.queue) - self.last_index)
+            original_left_over = (
+                None if self.original_queue is None else self.original_queue[self.last_index :].clone()
+            )
+            processed_left_over = (
+                None if self.queue is None else self.queue[self.last_index :].clone()
+            )
+            return ActionQueueSnapshot(
+                action_index=self.last_index,
+                remaining=remaining,
+                original_left_over=original_left_over,
+                processed_left_over=processed_left_over,
+            )
 
     def get_action_index(self) -> int:
         """Get the current action consumption index.

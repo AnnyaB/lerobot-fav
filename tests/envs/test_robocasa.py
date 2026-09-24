@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from unittest.mock import Mock, call
 
+import numpy as np
 import pytest
 
 from lerobot.envs import robocasa
@@ -59,6 +60,43 @@ def test_task_description_source_selects_training_distribution() -> None:
 
 def test_task_description_source_lang_falls_back_to_task() -> None:
     assert robocasa._resolve_task_description("CloseFridge", {}, "lang") == "CloseFridge"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("task", "CloseFridge"),
+        ("lang", "Close the refrigerator door."),
+    ],
+)
+def test_reset_applies_task_description_source_through_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(robocasa, "_get_task_horizon", lambda _: 100)
+
+    backend = Mock()
+    backend.reset.return_value = (
+        {"video.robot0_agentview_left": np.zeros((256, 256, 3), dtype=np.uint8)},
+        {},
+    )
+    backend.env.get_ep_meta.return_value = {"lang": "Close the refrigerator door."}
+
+    env = robocasa.RoboCasaEnv(
+        task="CloseFridge",
+        camera_name="robot0_agentview_left",
+        obs_type="pixels",
+        task_description_source=source,
+    )
+    env._env = backend
+
+    observation, info = env.reset(seed=500)
+
+    assert env.task_description == expected
+    assert observation["pixels"]["robot0_agentview_left"].shape == (256, 256, 3)
+    assert info == {"is_success": False}
+    backend.reset.assert_called_once_with(seed=500)
 
 
 def test_robocasa_config_rejects_unknown_task_description_source() -> None:

@@ -49,3 +49,33 @@ def test_explicit_episode_length_overrides_registered_horizons(monkeypatch: pyte
     assert envs["CloseFridge"][0][0]._max_episode_steps == 1234
     assert envs["SearingMeat"][0][0]._max_episode_steps == 1234
     get_task_horizon.assert_not_called()
+
+
+def test_task_description_source_selects_training_distribution() -> None:
+    ep_meta = {"lang": "Open the right drawer."}
+    assert robocasa._resolve_task_description("OpenDrawer", ep_meta, "lang") == "Open the right drawer."
+    assert robocasa._resolve_task_description("OpenDrawer", ep_meta, "task") == "OpenDrawer"
+
+
+def test_task_description_source_lang_falls_back_to_task() -> None:
+    assert robocasa._resolve_task_description("CloseFridge", {}, "lang") == "CloseFridge"
+
+
+def test_robocasa_config_rejects_unknown_task_description_source() -> None:
+    with pytest.raises(ValueError, match="task_description_source"):
+        RoboCasaEnvConfig(task_description_source="dataset")
+
+
+def test_create_robocasa_envs_propagates_task_description_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(robocasa, "_get_task_horizon", lambda _: 100)
+
+    envs = robocasa.create_robocasa_envs(
+        task="CloseFridge",
+        n_envs=1,
+        env_cls=_instantiate_envs,
+        gym_kwargs={"task_description_source": "task"},
+    )
+
+    assert envs["CloseFridge"][0][0].task_description_source == "task"

@@ -523,9 +523,9 @@ class RTCInferenceEngine(InferenceEngine):
                 if queue_snapshot.remaining <= self._rtc_queue_threshold:
                     try:
                         current_time = time.perf_counter()
-                        # Observation + queue state came from one worker-side atomic
-                        # snapshot. Do not re-read queue tails here: the control thread
-                        # may consume an action between reads.
+                        # Observation + queue state came from one observation-bound
+                        # atomic snapshot. Do not re-read queue tails here: the control
+                        # thread may consume an action after that control instant.
                         idx_before = queue_snapshot.action_index
                         prev_actions = queue_snapshot.original_left_over
                         has_previous_actions = prev_actions is not None and prev_actions.numel() > 0

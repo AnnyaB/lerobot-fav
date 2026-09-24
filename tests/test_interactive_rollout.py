@@ -1412,8 +1412,8 @@ def test_rtc_engine_answers_vqa_on_rtc_thread_delivered_by_control_pump():
         assert delivered[0].answer == "answer: what do you see?"
 
 
-def test_rtc_inference_consumes_only_one_worker_side_atomic_snapshot(monkeypatch):
-    """RUN-05 regression: RTC must not rebuild one logical state through separate live queue reads."""
+def test_rtc_inference_uses_observation_bound_snapshot_and_fences_after_merge(monkeypatch):
+    """RUN-05: one inference consumes one control-tick snapshot, then requires a fresh observation."""
     engine, policy = _make_rtc_engine(rtc_queue_threshold=30, chunk_len=10)
     engine.start()
     try:
@@ -1425,18 +1425,19 @@ def test_rtc_inference_consumes_only_one_worker_side_atomic_snapshot(monkeypatch
         queue.merge(original, processed, real_delay=0, task="task A")
         engine.notify_observation(dict(_RTC_OBS))
 
-        captured = []
-        real_snapshot = queue.snapshot
+        bound = engine._obs_holder["state_snapshot"]
+        assert bound is not None
+        assert bound.queue.action_index == 0
+        torch.testing.assert_close(bound.queue.original_left_over, original)
+        torch.testing.assert_close(bound.queue.processed_left_over, processed)
 
-        def recording_snapshot():
-            snapshot = real_snapshot()
-            captured.append(snapshot)
-            return snapshot
-
-        monkeypatch.setattr(queue, "snapshot", recording_snapshot)
-
-        # If the inference thread tries the old mixed-time path, fail immediately.
-        # A correct implementation obtains cursor + both tails through queue.snapshot().
+        # The worker must consume the bound snapshot instead of rebuilding it from
+        # independent queue reads after publication.
+        monkeypatch.setattr(
+            queue,
+            "snapshot",
+            MagicMock(side_effect=AssertionError("worker rebuilt observation-bound snapshot")),
+        )
         for method_name in ("get_action_index", "get_left_over", "get_processed_left_over"):
             monkeypatch.setattr(
                 queue,
@@ -1448,10 +1449,12 @@ def test_rtc_inference_consumes_only_one_worker_side_atomic_snapshot(monkeypatch
         policy.allow_one_inference()
         assert _wait_for(lambda: len(policy.predicted_tasks) == 1)
         assert not engine.failed
-        assert captured
-        assert captured[0].action_index == 0
-        torch.testing.assert_close(captured[0].original_left_over, original)
-        torch.testing.assert_close(captured[0].processed_left_over, processed)
+
+        # Publishing the inferred chunk is a structural queue replacement. The old
+        # observation-bound snapshot is now fenced until the control loop notifies a
+        # fresh observation.
+        assert queue.get_generation() == bound.queue.generation + 1
+        assert engine._capture_state_snapshot() is None
     finally:
         policy.unblock()
         engine.stop()

@@ -84,7 +84,7 @@ All eval snippets below mirror the CI command (see `.github/workflows/benchmark_
 
 By default, each task uses the rollout horizon registered by RoboCasa. Set `--env.episode_length=<steps>` to apply the same explicit horizon to every selected task.
 
-RoboCasa exposes two task-string sources for policy conditioning. `--env.task_description_source=lang` (the backward-compatible default) uses RoboCasa's natural-language episode instruction. `--env.task_description_source=task` uses the canonical task name. The released `lerobot/smolvla_robocasa` checkpoint was trained on canonical task names, so use `task` when reproducing that checkpoint's evaluation; otherwise the instruction itself is out of distribution.
+RoboCasa exposes two task-string sources for policy conditioning. `--env.task_description_source=lang` (the backward-compatible default) uses RoboCasa's natural-language episode instruction. `--env.task_description_source=task` uses the canonical task name. The released `lerobot/smolvla_robocasa` checkpoint was trained on canonical task names, so use `task` when reproducing that checkpoint's evaluation; otherwise the instruction itself is out of distribution. The released checkpoint examples below also pin `--env.split=target` so instruction-source comparisons use the target benchmark distribution rather than silently mixing evaluation protocols.
 
 ### Single-task evaluation (recommended for quick iteration)
 
@@ -93,6 +93,7 @@ lerobot-eval \
   --policy.path=lerobot/smolvla_robocasa \
   --env.type=robocasa \
   --env.task=CloseFridge \
+  --env.split=target \
   --env.task_description_source=task \
   --eval.batch_size=1 \
   --eval.n_episodes=20 \
@@ -110,6 +111,7 @@ lerobot-eval \
   --policy.path=lerobot/smolvla_robocasa \
   --env.type=robocasa \
   --env.task=CloseFridge,OpenCabinet,OpenDrawer,TurnOnMicrowave,TurnOffStove \
+  --env.split=target \
   --env.task_description_source=task \
   --eval.batch_size=1 \
   --eval.n_episodes=20 \
@@ -127,6 +129,7 @@ lerobot-eval \
   --policy.path=lerobot/smolvla_robocasa \
   --env.type=robocasa \
   --env.task=atomic_seen \
+  --env.split=target \
   --env.task_description_source=task \
   --eval.batch_size=1 \
   --eval.n_episodes=20 \

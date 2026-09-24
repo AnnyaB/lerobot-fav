@@ -251,6 +251,44 @@ def test_get_action_index_after_consumption(action_queue_rtc_enabled, sample_act
     assert action_queue_rtc_enabled.get_action_index() == 3
 
 
+# snapshot() tests
+
+
+def test_snapshot_captures_cursor_and_both_tails_from_one_instant(
+    action_queue_rtc_enabled, sample_actions
+):
+    """A snapshot stays self-consistent if the control thread consumes immediately after it."""
+    original = sample_actions["original"][:6]
+    processed = sample_actions["processed"][:6]
+    action_queue_rtc_enabled.merge(original, processed, real_delay=0)
+
+    # Consume one action before the snapshot, then one immediately after it.
+    action_queue_rtc_enabled.get()
+    snapshot = action_queue_rtc_enabled.snapshot()
+    action_queue_rtc_enabled.get()
+
+    assert snapshot.action_index == 1
+    assert snapshot.remaining == 5
+    assert snapshot.original_left_over is not None
+    assert snapshot.processed_left_over is not None
+    torch.testing.assert_close(snapshot.original_left_over, original[1:])
+    torch.testing.assert_close(snapshot.processed_left_over, processed[1:])
+
+    # The live queue advanced, but the detached snapshot did not.
+    assert action_queue_rtc_enabled.get_action_index() == 2
+    assert action_queue_rtc_enabled.qsize() == 4
+    torch.testing.assert_close(snapshot.original_left_over, original[1:])
+    torch.testing.assert_close(snapshot.processed_left_over, processed[1:])
+
+
+def test_snapshot_empty_queue_is_explicit(action_queue_rtc_enabled):
+    snapshot = action_queue_rtc_enabled.snapshot()
+    assert snapshot.action_index == 0
+    assert snapshot.remaining == 0
+    assert snapshot.original_left_over is None
+    assert snapshot.processed_left_over is None
+
+
 # get_left_over() tests
 
 

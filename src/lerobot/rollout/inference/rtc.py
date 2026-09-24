@@ -25,6 +25,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+from dataclasses import dataclass
 import time
 import traceback
 from threading import Event, Lock, Thread
@@ -34,6 +35,7 @@ import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
+from lerobot.policies.rtc.action_queue import ActionQueueSnapshot
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import (
@@ -186,6 +188,21 @@ def _clamp_trained_rtc_delay(*, conditioned_delay: int, available_steps: int, tr
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RTCStateSnapshot:
+    """Observation and action-queue state captured at one linearization point.
+
+    The RTC worker must never build an inference request by reading the observation
+    and queue through separate critical sections: the control loop can consume an
+    action or a completed inference can replace the queue between those reads.
+    """
+
+    observation: dict[str, Any]
+    queue: ActionQueueSnapshot
+    reset_epoch: int
+    captured_at: float
+
+
 class RTCInferenceEngine(InferenceEngine):
     """Async RTC inference: a background thread produces action chunks.
 
@@ -300,7 +317,6 @@ class RTCInferenceEngine(InferenceEngine):
         self._action_queue = ActionQueue(self._rtc_config)
         self._obs_holder = {
             "obs": None,
-            "queue_snapshot": None,
             "robot_type": self._robot.robot_type,
         }
         self._shutdown_event.clear()
@@ -354,7 +370,6 @@ class RTCInferenceEngine(InferenceEngine):
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
-            self._obs_holder["queue_snapshot"] = None
             self._reset_epoch += 1
         # The queue is empty, so a pending task change has nothing stale to blend against.
         self._discard_task_change()
@@ -364,13 +379,20 @@ class RTCInferenceEngine(InferenceEngine):
     # ------------------------------------------------------------------
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
-        """Pop the next action from the RTC queue (ignores ``obs_frame``)."""
-        if self._action_queue is None:
-            return None
-        queued = self._action_queue.get_with_task()
+        """Pop the next action from the RTC queue (ignores ``obs_frame``).
+
+        Action consumption participates in the same outer critical section used by
+        RTC snapshot capture. This gives observation publication, action consumption,
+        reset, and chunk replacement one lock order: ``_obs_lock -> queue.lock``.
+        """
+        with self._obs_lock:
+            queue = self._action_queue
+            if queue is None:
+                return None
+            queued = queue.get_with_task()
         if queued is None:
             return None
-        # The queue pairs each action with its chunk's task under the queue lock, so a
+        # The queue pairs each action with its chunk\'s task under the queue lock, so a
         # concurrent merge cannot cross labels between chunks.
         action, task = queued
         if task is None:
@@ -381,19 +403,36 @@ class RTCInferenceEngine(InferenceEngine):
         return action
 
     def notify_observation(self, obs: dict) -> None:
-        """Publish an observation with the queue state from the same control instant.
+        """Publish the latest observation.
 
-        The control loop calls this immediately before requesting the next queued
-        action. Capture the queue while holding the observation lock so RTC never
-        combines this observation with leftovers read after a concurrent action pop.
+        Queue state is intentionally *not* cached here. The worker captures the
+        observation and live queue together immediately before inference, so a chunk
+        replacement that lands after this notification cannot leave behind a stale
+        queue snapshot paired with this observation.
+        """
+        with self._obs_lock:
+            self._obs_holder["obs"] = obs
 
-        Lock order is observation lock then queue lock, matching reset() and the
-        merge/reset critical section in the RTC loop.
+    def _capture_state_snapshot(self) -> RTCStateSnapshot | None:
+        """Capture observation and queue state at one linearization point.
+
+        Every RTC queue mutation/consumption performed by this engine takes
+        ``_obs_lock`` before ``queue.lock``. Holding the outer lock while
+        :meth:`ActionQueue.snapshot` clones the queue tails therefore prevents an
+        observation from being paired with a cursor from a different control instant.
+        The lock is released before preprocessing or GPU inference.
         """
         with self._obs_lock:
             queue = self._action_queue
-            self._obs_holder["obs"] = obs
-            self._obs_holder["queue_snapshot"] = None if queue is None else queue.snapshot()
+            obs = self._obs_holder.get("obs")
+            if queue is None or obs is None:
+                return None
+            return RTCStateSnapshot(
+                observation=obs,
+                queue=queue.snapshot(),
+                reset_epoch=self._reset_epoch,
+                captured_at=time.perf_counter(),
+            )
 
     # ------------------------------------------------------------------
     # Text queries
@@ -448,13 +487,13 @@ class RTCInferenceEngine(InferenceEngine):
                     continue
 
                 queue = self._action_queue
-                with self._obs_lock:
-                    obs = self._obs_holder.get("obs")
-                    queue_snapshot = self._obs_holder.get("queue_snapshot")
-                    epoch_before = self._reset_epoch
-                if queue is None or obs is None or queue_snapshot is None:
+                snapshot = self._capture_state_snapshot()
+                if queue is None or snapshot is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
+                obs = snapshot.observation
+                queue_snapshot = snapshot.queue
+                epoch_before = snapshot.reset_epoch
 
                 # Serve a queued text query here — this is the thread that owns the policy.  Above the
                 # refill branch on purpose: a query issued while the queue is full would otherwise wait
@@ -465,19 +504,19 @@ class RTCInferenceEngine(InferenceEngine):
                     # The generation took seconds, so the snapshot above is stale: re-read
                     # the observation, and the epoch so the discard guard below also covers
                     # a reset that landed during the query.
-                    with self._obs_lock:
-                        obs = self._obs_holder.get("obs")
-                        queue_snapshot = self._obs_holder.get("queue_snapshot")
-                        epoch_before = self._reset_epoch
-                    if obs is None or queue_snapshot is None:  # reset mid-query dropped the snapshot
+                    snapshot = self._capture_state_snapshot()
+                    if snapshot is None:  # a reset mid-query dropped the observation
                         continue
+                    obs = snapshot.observation
+                    queue_snapshot = snapshot.queue
+                    epoch_before = snapshot.reset_epoch
 
-                if queue.qsize() <= self._rtc_queue_threshold:
+                if queue_snapshot.remaining <= self._rtc_queue_threshold:
                     try:
                         current_time = time.perf_counter()
-                        # Observation + queue state were captured together by
-                        # notify_observation(). Do not re-read queue tails here:
-                        # the control thread may consume an action between reads.
+                        # Observation + queue state came from one worker-side atomic
+                        # snapshot. Do not re-read queue tails here: the control thread
+                        # may consume an action between reads.
                         idx_before = queue_snapshot.action_index
                         prev_actions = queue_snapshot.original_left_over
                         has_previous_actions = prev_actions is not None and prev_actions.numel() > 0

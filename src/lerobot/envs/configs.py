@@ -521,6 +521,7 @@ class RoboCasaEnv(EnvConfig):
     visualization_height: int = 512
     visualization_width: int = 512
     split: str | None = None
+    task_description_source: str = "lang"
     # Object-mesh registries to sample from. Upstream default is
     # ("objaverse", "lightwheel"), but objaverse is ~30GB and the CI image
     # only ships the lightwheel pack. Override to include objaverse once
@@ -535,6 +536,11 @@ class RoboCasaEnv(EnvConfig):
     def __post_init__(self):
         if self.obs_type not in ("pixels", "pixels_agent_pos"):
             raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+        if self.task_description_source not in ("lang", "task"):
+            raise ValueError(
+                "task_description_source must be either 'lang' or 'task', "
+                f"got '{self.task_description_source}'."
+            )
 
         # Preserve raw RoboCasa camera names end-to-end (e.g.
         # `observation.images.robot0_agentview_left`). This matches the
@@ -560,6 +566,7 @@ class RoboCasaEnv(EnvConfig):
             "observation_width": self.observation_width,
             "visualization_height": self.visualization_height,
             "visualization_width": self.visualization_width,
+            "task_description_source": self.task_description_source,
         }
         if self.split is not None:
             kwargs["split"] = self.split

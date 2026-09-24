@@ -1412,6 +1412,44 @@ def test_rtc_engine_answers_vqa_on_rtc_thread_delivered_by_control_pump():
         assert delivered[0].answer == "answer: what do you see?"
 
 
+def test_rtc_inference_consumes_only_the_queue_snapshot_bound_to_its_observation(monkeypatch):
+    """RUN-05 regression: RTC must not rebuild one logical snapshot through separate live queue reads."""
+    engine, policy = _make_rtc_engine(rtc_queue_threshold=30, chunk_len=10)
+    engine.start()
+    try:
+        queue = engine.action_queue
+        assert queue is not None
+
+        original = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+        processed = original + 100.0
+        queue.merge(original, processed, real_delay=0, task="task A")
+
+        # Publication captures observation + both queue tails at one control instant.
+        engine.notify_observation(dict(_RTC_OBS))
+        snapshot = engine._obs_holder["queue_snapshot"]
+        assert snapshot is not None
+        assert snapshot.action_index == 0
+        torch.testing.assert_close(snapshot.original_left_over, original)
+        torch.testing.assert_close(snapshot.processed_left_over, processed)
+
+        # If the inference thread tries the old mixed-time path, fail immediately.
+        # A correct implementation needs no live tail/cursor reads after publication.
+        for method_name in ("get_action_index", "get_left_over", "get_processed_left_over"):
+            monkeypatch.setattr(
+                queue,
+                method_name,
+                MagicMock(side_effect=AssertionError(f"live queue read: {method_name}")),
+            )
+
+        engine.resume()
+        policy.allow_one_inference()
+        assert _wait_for(lambda: len(policy.predicted_tasks) == 1)
+        assert not engine.failed
+    finally:
+        policy.unblock()
+        engine.stop()
+
+
 def test_rtc_engine_get_action_raises_on_unlabeled_action():
     """An unlabeled action would silently corrupt dispatched_task and the frame labels."""
     from lerobot.policies.rtc import ActionQueue

@@ -317,6 +317,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._action_queue = ActionQueue(self._rtc_config)
         self._obs_holder = {
             "obs": None,
+            "state_snapshot": None,
             "robot_type": self._robot.robot_type,
         }
         self._shutdown_event.clear()
@@ -370,6 +371,7 @@ class RTCInferenceEngine(InferenceEngine):
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
+            self._obs_holder["state_snapshot"] = None
             self._reset_epoch += 1
         # The queue is empty, so a pending task change has nothing stale to blend against.
         self._discard_task_change()
@@ -403,36 +405,43 @@ class RTCInferenceEngine(InferenceEngine):
         return action
 
     def notify_observation(self, obs: dict) -> None:
-        """Publish the latest observation.
+        """Publish an observation with the queue state from the same control tick.
 
-        Queue state is intentionally *not* cached here. The worker captures the
-        observation and live queue together immediately before inference, so a chunk
-        replacement that lands after this notification cannot leave behind a stale
-        queue snapshot paired with this observation.
-        """
-        with self._obs_lock:
-            self._obs_holder["obs"] = obs
-
-    def _capture_state_snapshot(self) -> RTCStateSnapshot | None:
-        """Capture observation and queue state at one linearization point.
-
-        Every RTC queue mutation/consumption performed by this engine takes
-        ``_obs_lock`` before ``queue.lock``. Holding the outer lock while
-        :meth:`ActionQueue.snapshot` clones the queue tails therefore prevents an
-        observation from being paired with a cursor from a different control instant.
-        The lock is released before preprocessing or GPU inference.
+        Rollout strategies notify the engine before consuming that tick\'s action.
+        Capturing the queue here therefore binds the observation to the prefix that
+        existed at the same control instant. A later queue replacement advances the
+        queue generation and fences this pair until a fresh observation is published.
         """
         with self._obs_lock:
             queue = self._action_queue
-            obs = self._obs_holder.get("obs")
-            if queue is None or obs is None:
-                return None
-            return RTCStateSnapshot(
-                observation=obs,
-                queue=queue.snapshot(),
-                reset_epoch=self._reset_epoch,
-                captured_at=time.perf_counter(),
+            self._obs_holder["obs"] = obs
+            self._obs_holder["state_snapshot"] = (
+                None
+                if queue is None
+                else RTCStateSnapshot(
+                    observation=obs,
+                    queue=queue.snapshot(),
+                    reset_epoch=self._reset_epoch,
+                    captured_at=time.perf_counter(),
+                )
             )
+
+    def _capture_state_snapshot(self) -> RTCStateSnapshot | None:
+        """Return the latest observation-bound snapshot if its queue is still current.
+
+        Action consumption does not change the queue generation, so the snapshot stays
+        valid while actions from that queue are consumed. ``merge()`` and ``clear()``
+        do advance the generation; after either event RTC waits for the next fresh
+        observation rather than combining an old observation with a replacement queue.
+        """
+        with self._obs_lock:
+            queue = self._action_queue
+            snapshot = self._obs_holder.get("state_snapshot")
+            if queue is None or snapshot is None:
+                return None
+            if queue.get_generation() != snapshot.queue.generation:
+                return None
+            return snapshot
 
     # ------------------------------------------------------------------
     # Text queries
@@ -634,14 +643,16 @@ class RTCInferenceEngine(InferenceEngine):
 
                         consecutive_discards = 0
                         with self._obs_lock:
-                            # Check and merge in one critical section, mirroring reset()'s
-                            # clear-and-bump, so a reset cannot land between them and leak
-                            # a pre-reset chunk.  Lock order: _obs_lock -> queue.lock.
+                            # Reset invalidates the episode; queue replacement invalidates
+                            # the observation-bound prefix. Check both before publishing.
                             epoch_unchanged = epoch_before == self._reset_epoch
-                            if epoch_unchanged:
+                            generation_unchanged = queue.get_generation() == queue_snapshot.generation
+                            if epoch_unchanged and generation_unchanged:
                                 queue.merge(original, processed, new_delay, idx_before, task=task)
                         if not epoch_unchanged:
                             logger.info("Discarding action chunk computed before an engine reset")
+                        elif not generation_unchanged:
+                            logger.info("Discarding action chunk computed from an obsolete queue generation")
 
                         if (
                             is_warmup

@@ -61,6 +61,8 @@ DEFAULT_OBJ_REGISTRIES: tuple[str, ...] = ("lightwheel",)
 # these names, we expand it to the upstream RoboCasa task list and auto-set
 # the dataset split. Individual task names (optionally comma-separated) still
 # take precedence; this only triggers on an exact group-name match.
+_TASK_DESCRIPTION_SOURCES = {"lang", "task"}
+
 _TASK_GROUP_SPLITS = {
     "atomic_seen": "target",
     "composite_seen": "target",
@@ -96,6 +98,23 @@ def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     if not names:
         raise ValueError("`task` must contain at least one RoboCasa task name.")
     return names, None
+
+
+def _resolve_task_description(task: str, ep_meta: dict[str, Any], source: str) -> str:
+    """Return the policy-conditioning task string for one RoboCasa episode.
+
+    ``lang`` preserves RoboCasa's natural-language instruction. ``task`` uses
+    the canonical task name, which is required when a checkpoint was trained
+    on dataset task names rather than natural-language episode metadata.
+    """
+    if source == "task":
+        return task
+    if source == "lang":
+        return str(ep_meta.get("lang") or task)
+    raise ValueError(
+        f"Unsupported task_description_source '{source}'. "
+        f"Expected one of {sorted(_TASK_DESCRIPTION_SOURCES)}."
+    )
 
 
 def _get_task_horizon(task: str) -> int:
@@ -149,6 +168,7 @@ class RoboCasaEnv(gym.Env):
         episode_length: int | None = None,
         obj_registries: Sequence[str] = DEFAULT_OBJ_REGISTRIES,
         episode_index: int = 0,
+        task_description_source: str = "lang",
     ):
         super().__init__()
         self.task = task
@@ -160,6 +180,12 @@ class RoboCasaEnv(gym.Env):
         self.visualization_height = visualization_height
         self.split = split
         self.obj_registries = tuple(obj_registries)
+        if task_description_source not in _TASK_DESCRIPTION_SOURCES:
+            raise ValueError(
+                f"Unsupported task_description_source '{task_description_source}'. "
+                f"Expected one of {sorted(_TASK_DESCRIPTION_SOURCES)}."
+            )
+        self.task_description_source = task_description_source
         # Per-worker index (0..n_envs-1) used to spread the user-provided
         # seed across factories so each sub-env explores a distinct layout
         # even when the same seed is passed to `reset()`.
@@ -232,7 +258,9 @@ class RoboCasaEnv(gym.Env):
         )
 
         ep_meta = self._env.env.get_ep_meta()
-        self.task_description = ep_meta.get("lang", self.task)
+        self.task_description = _resolve_task_description(
+            self.task, ep_meta, self.task_description_source
+        )
 
     def _format_raw_obs(self, raw_obs: dict) -> RobotObservation:
         """Convert RoboCasaGymEnv observation dict to LeRobot format."""
@@ -274,7 +302,9 @@ class RoboCasaEnv(gym.Env):
         raw_obs, info = self._env.reset(seed=worker_seed)
 
         ep_meta = self._env.env.get_ep_meta()
-        self.task_description = ep_meta.get("lang", self.task)
+        self.task_description = _resolve_task_description(
+            self.task, ep_meta, self.task_description_source
+        )
 
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False}
@@ -326,6 +356,7 @@ def _make_env_fns(
     split: str | None,
     episode_length: int | None,
     obj_registries: Sequence[str],
+    task_description_source: str,
 ) -> list[Callable[[], RoboCasaEnv]]:
     """Build n_envs factory callables for a single task.
 
@@ -348,6 +379,7 @@ def _make_env_fns(
             episode_length=episode_length,
             obj_registries=obj_registries,
             episode_index=episode_index,
+            task_description_source=task_description_source,
         )
 
     return [partial(_make_env, i) for i in range(n_envs)]
@@ -388,6 +420,7 @@ def create_robocasa_envs(
     visualization_width = gym_kwargs.pop("visualization_width", 512)
     visualization_height = gym_kwargs.pop("visualization_height", 512)
     split = gym_kwargs.pop("split", None)
+    task_description_source = gym_kwargs.pop("task_description_source", "lang")
 
     camera_names = parse_camera_names(camera_name)
     task_names, group_split = _resolve_tasks(str(task))
@@ -395,9 +428,10 @@ def create_robocasa_envs(
         split = group_split
 
     logger.info(
-        "Creating RoboCasa envs | tasks=%s | split=%s | n_envs(per task)=%d",
+        "Creating RoboCasa envs | tasks=%s | split=%s | task_description_source=%s | n_envs(per task)=%d",
         task_names,
         split,
+        task_description_source,
         n_envs,
     )
 
@@ -422,6 +456,7 @@ def create_robocasa_envs(
             split=split,
             episode_length=episode_length,
             obj_registries=obj_registries,
+            task_description_source=task_description_source,
         )
 
         if is_async:

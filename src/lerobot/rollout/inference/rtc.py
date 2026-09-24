@@ -300,6 +300,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._action_queue = ActionQueue(self._rtc_config)
         self._obs_holder = {
             "obs": None,
+            "queue_snapshot": None,
             "robot_type": self._robot.robot_type,
         }
         self._shutdown_event.clear()
@@ -353,6 +354,7 @@ class RTCInferenceEngine(InferenceEngine):
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
+            self._obs_holder["queue_snapshot"] = None
             self._reset_epoch += 1
         # The queue is empty, so a pending task change has nothing stale to blend against.
         self._discard_task_change()
@@ -379,9 +381,19 @@ class RTCInferenceEngine(InferenceEngine):
         return action
 
     def notify_observation(self, obs: dict) -> None:
-        """Publish the latest observation for the RTC thread to consume."""
+        """Publish an observation with the queue state from the same control instant.
+
+        The control loop calls this immediately before requesting the next queued
+        action. Capture the queue while holding the observation lock so RTC never
+        combines this observation with leftovers read after a concurrent action pop.
+
+        Lock order is observation lock then queue lock, matching reset() and the
+        merge/reset critical section in the RTC loop.
+        """
         with self._obs_lock:
+            queue = self._action_queue
             self._obs_holder["obs"] = obs
+            self._obs_holder["queue_snapshot"] = None if queue is None else queue.snapshot()
 
     # ------------------------------------------------------------------
     # Text queries
@@ -438,8 +450,9 @@ class RTCInferenceEngine(InferenceEngine):
                 queue = self._action_queue
                 with self._obs_lock:
                     obs = self._obs_holder.get("obs")
+                    queue_snapshot = self._obs_holder.get("queue_snapshot")
                     epoch_before = self._reset_epoch
-                if queue is None or obs is None:
+                if queue is None or obs is None or queue_snapshot is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
@@ -454,15 +467,19 @@ class RTCInferenceEngine(InferenceEngine):
                     # a reset that landed during the query.
                     with self._obs_lock:
                         obs = self._obs_holder.get("obs")
+                        queue_snapshot = self._obs_holder.get("queue_snapshot")
                         epoch_before = self._reset_epoch
-                    if obs is None:  # a reset mid-query dropped the observation
+                    if obs is None or queue_snapshot is None:  # reset mid-query dropped the snapshot
                         continue
 
                 if queue.qsize() <= self._rtc_queue_threshold:
                     try:
                         current_time = time.perf_counter()
-                        idx_before = queue.get_action_index()
-                        prev_actions = queue.get_left_over()
+                        # Observation + queue state were captured together by
+                        # notify_observation(). Do not re-read queue tails here:
+                        # the control thread may consume an action between reads.
+                        idx_before = queue_snapshot.action_index
+                        prev_actions = queue_snapshot.original_left_over
                         has_previous_actions = prev_actions is not None and prev_actions.numel() > 0
 
                         policy_config = getattr(self._policy, "config", None)
@@ -504,7 +521,7 @@ class RTCInferenceEngine(InferenceEngine):
                             # the training-time coordinate frame.
                             raw_state = self._relative_step.get_cached_state()
                             if raw_state is not None:
-                                prev_abs = queue.get_processed_left_over()
+                                prev_abs = queue_snapshot.processed_left_over
                                 if prev_abs is not None and prev_abs.numel() > 0:
                                     prev_actions = reanchor_relative_rtc_prefix(
                                         prev_actions_absolute=prev_abs,

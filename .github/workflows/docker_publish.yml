@@ -21,9 +21,6 @@ on:
   # Allows running this workflow manually from the Actions tab
   workflow_dispatch:
 
-  # Runs at 02:00
-  schedule:
-    - cron: "0 2 * * *"
 
 # Sets up the environment variables
 env:
